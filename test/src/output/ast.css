@@ -1,0 +1,14 @@
+.multiple {
+    display: flex;
+}
+*:focus {
+    background-color: rgb(192, 215, 242);
+    outline: none;
+}
+.input {
+    border: 0;
+    background-color: rgba(255, 255, 255, 0.397);
+}
+.input:focus {
+    background-color: rgb(192, 215, 242);
+}
