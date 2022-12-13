@@ -1,52 +1,48 @@
 extern crate ebnf;
-use tera::{Tera, Context};
-use once_cell::sync::Lazy;
+use tera::Context;
 use std::cmp;
-
-static TERA : Lazy<Tera> = Lazy::new(||{
-    let mut tera = Tera::default();
-
-    tera.add_raw_template("component", r"
-const {{name}}: React.FC<ComponenetInput> = (props) => {
-    {% for select in selects%}
-    const [select{{select}}, setSelect{{select}}] = useState(-1);
-    {%- endfor %}
-    let expr: {{name}}_node = new {{name}}_node(props.parent);
-    props.setCurrent(expr);
-    return {{jsx}};
-}
-").unwrap();
-
-    tera.add_raw_template("AST", r"
-export class {{name}}_node extends AST_node {
-    consutructor(parent: AST_node|undefinded){
-        super(parent);
-    }
-    accept = (v : Visitor) => { v.visit{{name}}_node(this); }
-    child: {{type}} = [];
-}
-").unwrap();
-
-    tera
-});
+use std::fs;
+mod templates;
 
 fn main() {
     let source = r"
-    program     ::= expr;
+    program     ::= expr*;
     expr        ::= const | binary;
-    binary      ::= expr binaryOp expr;
-    binaryOp    ::= '+' | '*' | ('-' | 'n') | '/';
+    binary      ::= '(' expr binaryOp expr ')';
+    binaryOp    ::= '+' | '*' | '-' | '/';
     const       ::= #'[0-9]+';
 ";
+//     let source = r"
+//     program     ::= expression+;
+//     expression  ::= 'a' | (borc '+' expression);
+//     borc        ::= 'b' | 'c';
+// ";
 
     let result = ebnf::get_grammar(source).unwrap();
-    println!("{:#?}",result);
+    // println!("{:#?}",result);
+    let mut astNodes: Vec<String> = vec![];
+    let mut components: Vec<String> = vec![];
+    let mut names: Vec<String> = vec![];
+    let mut first = true;
     result.expressions.iter().for_each(|item| {
-        println!("{}",expression_to_ast(&item));
+        if first{
+            components.push(expression_to_top_component(&item));
+            first = false;
+        }
+        else{
+            components.push(expression_to_component(&item));
+        }
+        astNodes.push(expression_to_ast(&item));
+        names.push(item.lhs.to_string());
     });
-    result.expressions.iter().for_each(|item| {
-        println!("{}",expression_to_component(&item));
-    });
+    let mut componentContext = Context::new();
+    componentContext.insert("names", &names);
+    componentContext.insert("components", &components);
+    fs::write("components.tsx", templates::TERA.render("component_file",&componentContext).unwrap()).expect("can't write to file");
+
+    let mut astContext = Context::new();
+    astContext.insert("astNodes", &astNodes);
+    fs::write("ast.ts", templates::TERA.render("ast_file",&astContext).unwrap()).expect("can't write to file");
 
 }
 fn upper(s: &str) -> String {
@@ -77,73 +73,86 @@ fn alternation_to_list(node: &ebnf::Node) -> Result<Vec<&Box<ebnf::Node>>,i32>{
     }
 }
 
-fn node_to_ids(node: &ebnf::Node) -> Vec<String>{
-    fn node_ids_helper(node: &ebnf::Node, mult_index: &Vec<i32>, last_select: &str, ret: &mut Vec<String>) {
-        let id = &(mult_index.iter().map(|i|i.to_string()).collect::<Vec<String>>().join("_") + "_" + last_select);
+fn node_to_ids(node: &ebnf::Node, select: bool) -> Vec<String>{
+    fn node_ids_helper(node: &ebnf::Node, ids: &Vec<i32>, ret: &mut Vec<String>, select: bool) {
+        let id = &(ids.iter().map(|i|i.to_string()).collect::<Vec<String>>().join("_"));
         match node {
             ebnf::Node::String(s) => {0},
             ebnf::Node::RegexString(s) => {0},
             ebnf::Node::Terminal(s) => {0},
             ebnf::Node::Multiple(nodes) => {
-                let _ = nodes.iter().enumerate().map(|(i,n)| node_ids_helper(n,&[&mult_index[..], &[i as i32 + 1]].concat(), last_select,ret));
+                let _ = nodes.iter().enumerate().map(|(i,n)| node_ids_helper(n,&[&ids[..], &[i as i32]].concat(), ret, select));
                 0
         },
-            ebnf::Node::RegexExt(n, _kind) => {node_ids_helper(n,mult_index,last_select, ret); 0},
+            ebnf::Node::RegexExt(n, _kind) => {node_ids_helper(n, ids,ret, select); 0},
             ebnf::Node::Symbol(left, _kind, right) => {
                 let v = alternation_to_list(node).unwrap();
-                ret.push(id.to_string());
-                v.iter().map( |n|{node_ids_helper(n,mult_index,id,ret);0}).collect::<Vec<i32>>();
+                if select {
+                    ret.push(id.to_string());
+                }
+                v.iter().enumerate().map(|(i, n)|{node_ids_helper(n,&[&ids[..], &[i as i32]].concat(), ret, select)}).for_each(drop);
                 0
             },
-            ebnf::Node::Group(n) => {node_ids_helper(n,mult_index,last_select,ret);0},
-            ebnf::Node::Optional(n) => {node_ids_helper(n,mult_index,last_select,ret);0},
-            ebnf::Node::Repeat(n) => {node_ids_helper(n,mult_index,last_select,ret);0},
+            ebnf::Node::Group(n) => {node_ids_helper(n,ids,ret,select);0},
+            ebnf::Node::Optional(n) => {node_ids_helper(n,ids,ret,select);0},
+            ebnf::Node::Repeat(n) => {node_ids_helper(n,ids,ret,select);0},
             ebnf::Node::Unknown => {0},
         };
     }
     let mut ret = vec![];
-    node_ids_helper(node, &vec![],"",&mut ret);
+    node_ids_helper(node, &vec![0],&mut ret,select);
     return ret;
 }
 
-fn node_to_jsx(node: &ebnf::Node) -> String{
-    fn node_to_jsx_helper(node: &ebnf::Node, mult_index: &Vec<i32>, last_select: &str) -> String {
+fn list_to_str(input: &Vec<&str>) -> String {
+    format!("[{}]", input.iter().fold(String::new(), |acc, val| acc + val + ", "))
+}
+
+fn node_to_jsx(node: &ebnf::Node, name: &str) -> String{
+    fn node_to_jsx_helper(node: &ebnf::Node, mult_index: &Vec<&str>, last_select: &str, ids: &Vec<i32>, last_variatic: i32) -> String {
+        let id = ids.iter().map(|i|i.to_string()).collect::<Vec<String>>().join("_");
         return match node {
-            ebnf::Node::String(s) => {format!("<Default {{...new ComponentInput(expr,{:?},{})}}/>",mult_index,s)},
-            ebnf::Node::RegexString(s) => {format!("<TextInput {{...new ComponentInput(expr,{:?})}}/>",mult_index)},
-            ebnf::Node::Terminal(s) => {format!("<{} {{...new ComponentInput(expr,{:?})}}/>",upper(s),mult_index)},
+            ebnf::Node::String(s) => {format!("<Default {{...new ComponentInput(expr,{},'{}')}}/>",list_to_str(mult_index),s)},
+            ebnf::Node::RegexString(s) => {format!("<TextInput {{...new ComponentInput(expr,{})}}/>",list_to_str(mult_index))},
+            ebnf::Node::Terminal(s) => {format!("<{} {{...new ComponentInput(expr,{})}}/>",upper(s),list_to_str(mult_index))},
             ebnf::Node::Multiple(nodes) => {
-                "<div>\n".to_string() + &node_to_jsx_helper(&nodes[0], mult_index, last_select) + &nodes.iter().enumerate()
-            .fold("".to_string(),|c:String,(i,n)| c+",\n"+&node_to_jsx_helper(n,&[&mult_index[..], &[i as i32]].concat(),last_select)) + "\n</div>"
+                "<div className=\"multiple\">\n".to_string() + &nodes.iter().enumerate()
+            .fold("".to_string(),|c:String,(i,n)| c+"\n"+&node_to_jsx_helper(n,&[&mult_index[..], &[&i.to_string()]].concat(),last_select,&[&ids[..], &[i as i32]].concat(),last_variatic)) + "\n</div>"
         },
-            ebnf::Node::RegexExt(n, _kind) => {node_to_string(n) + "[]"},
+            ebnf::Node::RegexExt(n, _kind) => {
+                let mut min = 0;
+                if matches!(_kind, ebnf::RegexExtKind::Repeat1){
+                    min = 1;
+                }
+                let mut adding = mult_index.clone();
+                let last = 'n'.to_string() + &last_variatic.to_string();
+                adding.push(&(last));
+                format!("<Variatic {{...new VariaticInput((n{}:number)=>{{\nreturn <div>\n",last_variatic) + &node_to_jsx_helper(n, &adding, last_select, ids, last_variatic+1) + &format!("\n</div>\n}},{})}}\n/>\n",min)
+            },
             ebnf::Node::Symbol(left, _kind, right) => {
                 let v = alternation_to_list(node).unwrap();
-                let id = mult_index.iter().map(|i|i.to_string()).collect::<Vec<String>>().join("_") + "_" + last_select;
                 let mut ending = "".to_string();
                 if last_select.len() != 0{
                     ending = format!(",setSelect{}",last_select);
                 }
-                "<Select\n{...\nnew Select_input([\"".to_string() + &node_to_string(v[0]) +"\"" + 
+                "<Select\n{...\nnew SelectInput([\"".to_string() + &node_to_string(v[0]) +"\"" + 
                 &v[1..].iter().fold(
                     "".to_string(),
                     |c,n|c+", \""+&node_to_string(n) + "\"")
                 + "],[\n" +
-                &node_to_jsx_helper(v[0], mult_index, &id) + "\n" +
-                &v[1..].iter().fold(
+                &node_to_jsx_helper(v[0], mult_index, &id, &[&ids[..], &[0]].concat(),last_variatic) + "\n" +
+                &v[1..].iter().enumerate().fold(
                     "".to_string(),
-                    |c,n|c+","+&node_to_jsx_helper(n,mult_index,&id) + "\n")
+                    |c,(i,n)|c+","+&node_to_jsx_helper(n,mult_index,&id, &[&ids[..], &[i as i32 + 1]].concat(),last_variatic) + "\n")
                 + "]," + &format!("select{x},setSelect{x}",x=id) + &ending + ")\n}\n/>"
-
-
             },
-            ebnf::Node::Group(n) => {node_to_jsx_helper(n,mult_index,last_select)},
-            ebnf::Node::Optional(n) => {node_to_jsx_helper(n,mult_index,last_select)},
-            ebnf::Node::Repeat(n) => {node_to_jsx_helper(n,mult_index,last_select)},
+            ebnf::Node::Group(n) => {node_to_jsx_helper(n,mult_index,last_select,ids,last_variatic)},
+            ebnf::Node::Optional(n) => {node_to_jsx_helper(n,mult_index,last_select,ids,last_variatic)},
+            ebnf::Node::Repeat(n) => {node_to_jsx_helper(n,mult_index,last_select,ids,last_variatic)},
             ebnf::Node::Unknown => {"".to_string()},
         }
     }
-    return node_to_jsx_helper(node, &vec![], "")
+    return format!("<div className=\"{}\">\n", name) + &node_to_jsx_helper(node, &vec![], "",&vec![0],0) + "\n</div>"
 }
 
 fn node_to_string(node: &ebnf::Node) -> String {
@@ -152,7 +161,7 @@ fn node_to_string(node: &ebnf::Node) -> String {
         ebnf::Node::RegexString(s) => {s.to_owned()},
         ebnf::Node::Terminal(s) => {"<".to_string() + s + ">"},
         ebnf::Node::Multiple(nodes) => {nodes.iter()
-        .fold("".to_string(),|c:String,n| c+","+&node_to_string(n))},
+        .fold("".to_string(),|c:String,n| c+" "+&node_to_string(n))},
         ebnf::Node::RegexExt(n, _kind) => {node_to_string(n) + "[]"},
         ebnf::Node::Symbol(left, _kind, right) => {node_to_string(left) + "|" + &node_to_string(right)},
         ebnf::Node::Group(n) => {"(".to_string() + &node_to_string(n) + ")"},
@@ -216,14 +225,25 @@ fn expression_to_ast(expression:&ebnf::Expression) -> String {
     context.insert("name", &expression.lhs);
     context.insert("type", &type_of(&expression.rhs));
     
-    return TERA.render("AST",&context).unwrap();
+    return templates::TERA.render("AST",&context).unwrap();
 }
 
 fn expression_to_component(expression:&ebnf::Expression) -> String{
     let mut context = Context::new();
-    context.insert("name", &expression.lhs);
-    context.insert("selects", &node_to_ids(&expression.rhs));
-    context.insert("jsx", &node_to_jsx(&expression.rhs));
+    context.insert("name", &upper(&expression.lhs));
+    context.insert("astname", (&expression.lhs));
+    context.insert("selects", &node_to_ids(&expression.rhs,true));
+    context.insert("jsx", &node_to_jsx(&expression.rhs,&expression.lhs));
 
-    return TERA.render("component",&context).unwrap();
+    return templates::TERA.render("component",&context).unwrap();
+}
+
+fn expression_to_top_component(expression:&ebnf::Expression) -> String{
+    let mut context = Context::new();
+    context.insert("name", &upper(&expression.lhs));
+    context.insert("astname", (&expression.lhs));
+    context.insert("selects", &node_to_ids(&expression.rhs,true));
+    context.insert("jsx", &node_to_jsx(&expression.rhs,&expression.lhs));
+
+    return templates::TERA.render("top_component",&context).unwrap();
 }
